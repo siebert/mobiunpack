@@ -16,6 +16,8 @@
 #         of test for trailing data/multibyte characters
 #  0.22 - Fixed problem with > 9 images
 #  0.23 - Now output Start guide item
+#  0.24 - set firstimg value for 'TEXtREAd'
+#  0.25 - Now added character set metadata to html file for utf-8 files.
 
 class Unbuffered:
 	def __init__(self, stream):
@@ -293,7 +295,7 @@ def getMetaData(extheader):
 
 def unpackBook(infile, outdir):
 	codec_map = {
-		1252 : 'Windows-1252',
+		1252 : 'windows-1252',
 		65001: 'utf-8',
 	}
 	if not os.path.exists(outdir):
@@ -310,7 +312,11 @@ def unpackBook(infile, outdir):
 
 	header = sect.loadSection(0)
 
-	firstimg, = struct.unpack_from('>L', header, 0x6C)
+	if sect.ident != 'TEXtREAd':
+		firstimg, = struct.unpack_from('>L', header, 0x6C)
+	else:
+		records, = struct.unpack_from('>H', header, 0x8)
+		firstimg = records + 1
 
 	crypto_type, = struct.unpack_from('>H', header, 0xC)
 	if crypto_type != 0:
@@ -402,10 +408,10 @@ def unpackBook(infile, outdir):
 		rawtext += data
 		
 	#write out raw text
-	#outraw = os.path.join(outdir, os.path.splitext(os.path.split(infile)[1])[0]) + '.rawml'
-	#f = open(outraw, 'wb')
-	#f.write(rawtext)
-	#f.close
+	# outraw = os.path.join(outdir, os.path.splitext(os.path.split(infile)[1])[0]) + '.rawml'
+	# f = open(outraw, 'wb')
+	# f.write(rawtext)
+	# f.close
 	
 	# write out the images to the folder of images, and make a note of the names
 	# we really only need the names to get the image type right.
@@ -461,6 +467,9 @@ def unpackBook(infile, outdir):
 			replacetext = r'''<img\1src="'''+ '''images/''' + imgnames[i] +'''"'''
 			srctext = re.sub(searchtext, replacetext, srctext)
 
+	# add in character set meta into the html header if needed
+	srctext = srctext[0:12]+'<meta http-equiv="content-type" content="text/html; charset='+metadata.get('Codec')+'" />'+srctext[12:]
+	
 	#write out source text
 	f = open(outsrc, 'wb')
 	f.write(srctext)
@@ -533,7 +542,7 @@ def unpackBook(infile, outdir):
 	f.close()
 
 def main(argv=sys.argv):
-	print "MobiUnpack 0.22"
+	print "MobiUnpack 0.24"
 	print "  Copyright (c) 2009 Charles M. Hannum <root@ihack.net>"
 	print "  With Images Support and Other Additions by P. Durrant and K. Hendricks"
 	if len(sys.argv) < 2:
