@@ -18,9 +18,17 @@
 #  0.23 - Now output Start guide item
 #  0.24 - set firstimg value for 'TEXtREAd'
 #  0.25 - Now added character set metadata to html file for utf-8 files.
+#  0.26 - Dictionary support added. Image handling speed improved. For huge files create temp files to speed up decoding.
+#         Language decoding fixed. Metadata is now converted to utf-8 when written to opf file.
+
+DEBUG = False
+""" Set to True to print debug information. """
 
 WRITE_RAW_DATA = False
 """ Set to True to create additional files with raw data for debugging/reverse engineering. """
+
+HUGE_FILE_SIZE = 5 * 1024 * 1024
+""" If the size of the uncompressed raw html exceeds this limit, use temporary files to speed up processing. """
 
 class Unbuffered:
 	def __init__(self, stream):
@@ -303,9 +311,9 @@ def getSizeOfTrailingDataEntry(data):
 		num = (num << 7) | (ord(v) & 0x7f)
 	return num
 
-def getVariableLengthValue(data, offset):
+def getVariableWidthValue(data, offset):
 	'''
-	Decode variable length value from given bytes.
+	Decode variable width value from given bytes.
 	
 	@param data: The bytes to decode.
 	@param offset: The start offset into data.
@@ -327,7 +335,7 @@ def toHex(byteList):
 	Convert list of characters into a string of hex values.
 	
 	@param byteList: List of characters.
-	@return: String with the characters hex values separated by spaces.
+	@return: String with the character hex values separated by spaces.
 	'''
 	return " ".join([hex(ord(c))[2:].zfill(2) for c in byteList])
 
@@ -347,7 +355,7 @@ def countSetBits(value, bits = 8):
 	
 	@param value: Integer value.
 	@param bits: The number of bits of the input value (defaults to 8).
-	@return: Amount of set bits.
+	@return: Number of set bits.
 	'''
 	count = 0
 	for _ in range(bits):
@@ -365,7 +373,7 @@ def readTagSection(start, data):
 	@return: Tuple of control byte count and list of tag tuples.
 	'''
 	tags = []
-	assert(data[start:start+4] == "TAGX")
+	assert data[start:start+4] == "TAGX"
 	firstEntryOffset, = struct.unpack_from('>L', data, start + 0x04)
 	controlByteCount, = struct.unpack_from('>L', data, start + 0x08)
 
@@ -379,12 +387,13 @@ def getInflectionGroups(mainEntry, controlByteCount, tagTable, data, inflectionN
 	'''
 	Create string which contains the inflection groups with inflection rules as mobipocket tags.
 	
-	@param mainEntry: The base form to inflect.
+	@param mainEntry: The word to inflect.
 	@param controlByteCount: The number of control bytes.
 	@param tagTable: The tag table.
 	@param data: The inflection index data.
 	@param inflectionNames: The inflection rule name data.
 	@param groupList: The list of inflection groups to process.
+	@return: String with inflection groups and rules or empty string if required tags are not available.
 	'''
 	result = ""
 	idxtPos, = struct.unpack_from('>L', data, 0x14)
@@ -397,7 +406,7 @@ def getInflectionGroups(mainEntry, controlByteCount, tagTable, data, inflectionN
 			nextOffset = None
 
 		# First byte seems to be always 0x00 and must be skipped.
-		assert(ord(data[offset]) == 0x00)
+		assert ord(data[offset]) == 0x00
 		tagMap = getTagMap(controlByteCount, tagTable, data, offset + 1, nextOffset)
 
 		# Make sure that the required tags are available.
@@ -413,7 +422,7 @@ def getInflectionGroups(mainEntry, controlByteCount, tagTable, data, inflectionN
 		for i in range(len(tagMap[0x05])):
 			# Get name of inflection rule.
 			value = tagMap[0x05][i]
-			consumed, textLength = getVariableLengthValue(inflectionNames, value)
+			consumed, textLength = getVariableWidthValue(inflectionNames, value)
 			inflectionName = inflectionNames[value+consumed:value+consumed+textLength]
 
 			# Get and apply inflection rule.
@@ -430,6 +439,7 @@ def getInflectionGroups(mainEntry, controlByteCount, tagTable, data, inflectionN
 def hasTag(tagTable, tag):
 	'''
 	Test if tag table contains given tag.
+	
 	@param tagTable: The tag table.
 	@param tag: The tag to search.
 	@return: True if tag table contains given tag; False otherwise.
@@ -465,10 +475,10 @@ def getTagMap(controlByteCount, tagTable, entryData, startPos, endPos):
 		if value != 0:
 			if value == mask:
 				if countSetBits(mask) > 1:
-					# If all bits of masked value are set and the mask has more than one bit, a variable length value
+					# If all bits of masked value are set and the mask has more than one bit, a variable width value
 					# will follow after the control bytes which defines the length of bytes (NOT the value count!)
-					# which will contain the corresponding variable length values.
-					consumed, value = getVariableLengthValue(entryData, dataStart)
+					# which will contain the corresponding variable width values.
+					consumed, value = getVariableWidthValue(entryData, dataStart)
 					dataStart += consumed
 					tags.append((tag, None, value, valuesPerEntry))
 				else:
@@ -483,18 +493,18 @@ def getTagMap(controlByteCount, tagTable, entryData, startPos, endPos):
 	for tag, valueCount, valueBytes, valuesPerEntry in tags:
 		values = []
 		if valueCount != None:
-			# Read valueCount * valuesPerEntry variable length values.
+			# Read valueCount * valuesPerEntry variable width values.
 			for _ in range(valueCount):
 				for _ in range(valuesPerEntry):
-					consumed, data = getVariableLengthValue(entryData, dataStart)
+					consumed, data = getVariableWidthValue(entryData, dataStart)
 					dataStart += consumed
 					values.append(data)
 		else:
-			# Convert valueBytes to variable length values.
+			# Convert valueBytes to variable width values.
 			totalConsumed = 0
 			while totalConsumed < valueBytes:
 				# Does this work for valuesPerEntry != 1?
-				consumed, data = getVariableLengthValue(entryData, dataStart)
+				consumed, data = getVariableWidthValue(entryData, dataStart)
 				dataStart += consumed
 				totalConsumed += consumed
 				values.append(data)
@@ -507,7 +517,12 @@ def getTagMap(controlByteCount, tagTable, entryData, startPos, endPos):
 		# The last entry might have some zero padding bytes, so complain only if non zero bytes are left.
 		for char in entryData[dataStart:endPos]:
 			if char != chr(0x00):
-				print "Error: There are unprocessed bytes left: %s" % toHex(entryData[dataStart:endPos])
+				print "Warning: There are unprocessed index bytes left: %s" % toHex(entryData[dataStart:endPos])
+				if DEBUG:
+					print "controlByteCount: %s" % controlByteCount
+					print "tagTable: %s" % tagTable
+					print "data: %s" % toHex(entryData[startPos:endPos])
+					print "tagHashMap: %s" % tagHashMap
 				break
 
 	return tagHashMap
@@ -516,11 +531,11 @@ def applyInflectionRule(mainEntry, inflectionRuleData, start, end):
 	'''
 	Apply inflection rule.
 	
-	@param mainEntry: The string with the base word.
+	@param mainEntry: The word to inflect.
 	@param inflectionRuleData: The inflection rules.
 	@param start: The start position of the inflection rule to use.
 	@param end: The end position of the inflection rule to use.
-	@return: The string with the inflected base word or None if an error occurs.
+	@return: The string with the inflected word or None if an error occurs.
 	'''
 	mode = -1
 	byteArray = array.array("c", mainEntry)
@@ -537,10 +552,10 @@ def applyInflectionRule(mainEntry, inflectionRuleData, start, end):
 			position -= offset
 		elif byte > 0x13:
 			if mode == -1:
-				print "Error: Unexpected first byte %i" % byte
+				print "Error: Unexpected first byte %i of inflection rule" % byte
 				return None
 			elif position == -1:
-				print "Error: Unexpected first byte %i" % byte
+				print "Error: Unexpected first byte %i of inflection rule" % byte
 				return None
 			else:
 				if mode == 0x01:
@@ -554,13 +569,21 @@ def applyInflectionRule(mainEntry, inflectionRuleData, start, end):
 					# Delete at word end
 					position -= 1
 					deleted = byteArray.pop(position)
-					assert(deleted == char)
+					if deleted != char:
+						if DEBUG:
+							print "0x03: %s %s %s %s" % (mainEntry, toHex(inflectionRuleData[start:end]), char, deleted)
+						print "Error: Delete operation of inflection rule failed"
+						return None
 				elif mode == 0x04:
 					# Delete at word start
 					deleted = byteArray.pop(position)
-					assert(deleted == char)
+					if deleted != char:
+						if DEBUG:
+							print "0x03: %s %s %s %s" % (mainEntry, toHex(inflectionRuleData[start:end]), char, deleted)
+						print "Error: Delete operation of inflection rule failed"
+						return None
 				else:
-					print "Mode %x is not implemented" % mode
+					print "Error: Inflection rule mode %x is not implemented" % mode
 					return None
 		elif byte == 0x01:
 			# Insert at word start
@@ -583,7 +606,7 @@ def applyInflectionRule(mainEntry, inflectionRuleData, start, end):
 				position = 0
 			mode = byte
 		else:
-			print "Mode %x is not implemented" % byte
+			print "Error: Inflection rule mode %x is not implemented" % byte
 			return None
 	return byteArray.tostring()
 
@@ -630,7 +653,7 @@ def unpackBook(infile, outdir):
 	print "Mobipocket version %s" % version
 
 	# convert the codepage to codec string
-	codec = 'Windows-1252'
+	codec = 'windows-1252'
 	if codepage in codec_map.keys() :
 		codec = codec_map[codepage]
 
@@ -667,8 +690,11 @@ def unpackBook(infile, outdir):
 	metadata['Codec'] = codec
 	metadata['UniqueID'] = str(unique_id)
 
+	rawSize, = struct.unpack_from('>L', header, 0x4)
 	records, = struct.unpack_from('>H', header, 0x8)
 
+	hugeFile = True if rawSize > HUGE_FILE_SIZE else False
+		
 	multibyte = 0
 	trailers = 0
 	if sect.ident == 'BOOKMOBI':
@@ -712,14 +738,28 @@ def unpackBook(infile, outdir):
 	#get raw mobi html-like markup languge
 	print "Unpack raw html"
 	rawtext = ''
+	if hugeFile:
+		outraw = os.path.join(outdir, os.path.splitext(os.path.split(infile)[1])[0]) + '.rawml'
+		f = open(outraw, 'wb')
 	for i in xrange(records):
 		data = sect.loadSection(1+i)
 		data = trimTrailingDataEntries(data)
 		data = unpack(data)
-		rawtext += data
-		
+		if hugeFile:
+			f.write(data)
+		else:
+			rawtext += data
+
+	if hugeFile:
+		f.close()
+		f = open(outraw, 'rb')
+		rawtext = f.read()
+		f.close()
+		if not WRITE_RAW_DATA:
+			os.unlink(outraw)
+			
 	#write out raw text
-	if WRITE_RAW_DATA:
+	if WRITE_RAW_DATA and not hugeFile:
 		outraw = os.path.join(outdir, os.path.splitext(os.path.split(infile)[1])[0]) + '.rawml'
 		f = open(outraw, 'wb')
 		f.write(rawtext)
@@ -748,25 +788,28 @@ def unpackBook(infile, outdir):
 		else:
 			metaInflIndexData = sect.loadSection(metaInflIndex)
 			metaIndexCount, = struct.unpack_from('>L', metaInflIndexData, 0x18)
-			# We don't yet support dictionary with multiple inflection index sections.
-			assert (metaIndexCount == 1)
+			if metaIndexCount != 1:
+				print "Error: Dictionary contains multiple inflection index sections, which is not yet supported"
+				decodeInflection = False
 			inflIndexData = sect.loadSection(metaInflIndex + 1)
 			inflNameData = sect.loadSection(metaInflIndex + 1 + metaIndexCount)
 			tagSectionStart, = struct.unpack_from('>L', metaInflIndexData, 0x04)
 			inflectionControlByteCount, inflectionTagTable = readTagSection(tagSectionStart, metaInflIndexData)
-			#print "inflectionTagTable: %s" % inflectionTagTable
+			if DEBUG:
+				print "inflectionTagTable: %s" % inflectionTagTable
 			if hasTag(inflectionTagTable, 0x07):
-				print "Dictionary uses obsolete inflection rule scheme, skip inflection data"
+				print "Error: Dictionary uses obsolete inflection rule scheme which is not yet supported"
 				decodeInflection = False
 
 		data = sect.loadSection(metaOrthIndex)
 		tagSectionStart, = struct.unpack_from('>L', data, 0x04)
 		controlByteCount, tagTable = readTagSection(tagSectionStart, data)
 		orthIndexCount, = struct.unpack_from('>L', data, 0x18)
-		#print "orthTagTable: %s" % tagTable
+		if DEBUG:
+			print "orthTagTable: %s" % tagTable
 		hasEntryLength = hasTag(tagTable, 0x02)
 		if not hasEntryLength:
-			print "Index doesn't contain entry length tags"
+			print "Info: Index doesn't contain entry length tags"
 		
 		print "Read dictionary index data"
 		for i in range(metaOrthIndex + 1, metaOrthIndex + 1 + orthIndexCount):
@@ -791,14 +834,14 @@ def unpackBook(infile, outdir):
 						inflectionGroups = getInflectionGroups(text, inflectionControlByteCount, inflectionTagTable, inflIndexData, inflNameData, tagMap[0x2a])
 					else:
 						inflectionGroups = ""
-					assert(len(tagMap[0x01]) == 1)
+					assert len(tagMap[0x01]) == 1
 					entryStartPosition = tagMap[0x01][0]
 					if hasEntryLength:
 						if entryStartPosition in positionMap:
 							positionMap[entryStartPosition] = positionMap[entryStartPosition] + '<idx:entry><idx:orth value="%s">%s</idx:orth>' % (text, inflectionGroups)
 						else:
 							positionMap[entryStartPosition] = '<idx:entry><idx:orth value="%s">%s</idx:orth>' % (text, inflectionGroups)
-						assert(len(tagMap[0x02]) == 1)
+						assert len(tagMap[0x02]) == 1
 						entryEndPosition = entryStartPosition + tagMap[0x02][0]
 						if entryEndPosition in positionMap:
 							positionMap[entryEndPosition] = "</idx:entry>" + positionMap[entryEndPosition]
@@ -839,19 +882,36 @@ def unpackBook(infile, outdir):
 
 	# apply dictionary metadata and anchors
 	print "Insert data into html"
+	if hugeFile:
+		outtmp = os.path.join(outdir, os.path.splitext(os.path.split(infile)[1])[0]) + '.tmp'
+		f = open(outtmp, "wb")
+
 	pos = 0
 	srctext = ''
 	lastPos = len(rawtext)
 	for end in sorted(positionMap.keys()):
 		if end == 0 or end > lastPos:
 			continue # something's up - can't put a tag in outside <html>...</html>
-		srctext += rawtext[pos:end] + positionMap[end]
+		if hugeFile:
+			f.write(rawtext[pos:end])
+			f.write(positionMap[end])
+		else:
+			srctext += rawtext[pos:end] + positionMap[end]
 		pos = end
-	srctext += rawtext[pos:]
+
+	if hugeFile:
+		f.write(rawtext[pos:])
+		f.close()
 	
 	# free rawtext resources
 	rawtext = None
 
+	if hugeFile:
+		f = open(outtmp, "rb")
+		srctext = f.read()
+		f.close()
+		os.unlink(outtmp)
+		
 	# put in the hrefs
 	print "Insert hrefs into html"
 	link_pattern = re.compile(r'''<a filepos=['"]{0,1}0*(\d+)['"]{0,1} *>''', re.IGNORECASE)
@@ -952,9 +1012,10 @@ def unpackBook(infile, outdir):
 	f.close()
 
 def main(argv=sys.argv):
-	print "MobiUnpack 0.24"
+	print "MobiUnpack 0.26"
 	print "  Copyright (c) 2009 Charles M. Hannum <root@ihack.net>"
 	print "  With Images Support and Other Additions by P. Durrant and K. Hendricks"
+	print "  With Dictionary Support and Other Additions by S. Siebert"
 	if len(sys.argv) < 2:
 		print ""
 		print "Description:"
